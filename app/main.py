@@ -1,13 +1,20 @@
 import os
-import requests
-from flask import Flask, request, jsonify
-from flask_cors import CORS 
+from flask import Flask
+from flask_cors import CORS
 from dotenv import load_dotenv
+from app.routes import bp
+
+load_dotenv()
 
 
-load_dotenv();
+def create_app():
+    app = Flask(__name__)
+    CORS(app)
+    app.register_blueprint(bp, url_prefix="/api")
+    return app
 
-app = Flask(__name__)
-CORS(app)
 
-GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+if __name__ == "__main__":
+    app = create_app()
+    port = int(os.getenv("PORT", 5000))
+    app.run(debug=True, port=port)
