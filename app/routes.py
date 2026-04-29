@@ -1,5 +1,6 @@
 from flask import Blueprint, jsonify, request
-from github_client import GitHubClient
+from github_client import GitHubClient, build_candidates_from_search, build_candidate
+from ir import rank_candidates
 import requests as http_requests
 
 bp = Blueprint("api", __name__)
@@ -44,6 +45,25 @@ def get_user_repos(username):
     try:
         repos = client.get_user_repos(username, per_page=per_page, page=page)
         return jsonify([_slim_repo(r) for r in repos])
+    except http_requests.HTTPError as e:
+        return jsonify({"error": str(e)}), e.response.status_code
+
+
+@bp.route("/candidates")
+def get_candidates():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "Missing query parameter 'q'"}), 400
+
+    per_page = min(int(request.args.get("per_page", 20)), 30)
+    readme_limit = min(int(request.args.get("readme_limit", 3)), 5)
+
+    try:
+        candidates = build_candidates_from_search(
+            query, client, per_page=per_page, readme_limit=readme_limit
+        )
+        ranked = rank_candidates(query, candidates)
+        return jsonify({"query": query, "candidates": ranked})
     except http_requests.HTTPError as e:
         return jsonify({"error": str(e)}), e.response.status_code
 

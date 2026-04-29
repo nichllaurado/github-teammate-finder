@@ -50,6 +50,18 @@ class GitHubClient:
             "page": page,
         })
 
+    def get_readme(self, owner, repo):
+        """Fetch the README for a repository. Returns raw text or empty string."""
+        import base64
+        try:
+            data = self._get(f"/repos/{owner}/{repo}/readme")
+            content = data.get("content", "")
+            if data.get("encoding") == "base64":
+                return base64.b64decode(content).decode("utf-8", errors="ignore")
+            return content
+        except Exception:
+            return ""
+
     def get_rate_limit(self):
         """Check current API rate limit status."""
         return self._get("/rate_limit")
