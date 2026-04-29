@@ -1,3 +1,8 @@
+import json
+import os
+import re
+from datetime import datetime
+
 from .client import GitHubClient
 
 # Max README chars included in the document text (keeps tokens manageable)
@@ -7,15 +12,70 @@ README_FETCH_LIMIT = 3
 # Max repos included in the candidate's repo list
 REPO_LIST_LIMIT = 20
 
+# Path to outputs directory (two levels up from this file: github_client/ -> project root)
+_OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
+
+# Common English stopwords to skip when broadening a query
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "that", "this", "is", "it", "be", "as", "by", "i",
+    "want", "build", "create", "make", "use", "using", "uses",
+}
+
+
+def _broaden_query(query: str) -> str:
+    """
+    Convert a natural-language query into a GitHub search query by extracting
+    meaningful keywords and joining them with OR.
+    e.g. "AI event planning app that uses calendars" -> "AI OR event OR planning OR calendars"
+    """
+    words = re.findall(r"[A-Za-z0-9]+", query)
+    keywords = [w for w in words if len(w) > 2 and w.lower() not in _STOPWORDS]
+    if not keywords:
+        return query
+    return " OR ".join(keywords)
+
+
+def _save_search_output(query: str, search_results: dict, broadened: bool = False):
+    """Write raw search results to outputs/ for inspection during testing."""
+    os.makedirs(_OUTPUTS_DIR, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"search_results_{timestamp}.json"
+    filepath = os.path.join(_OUTPUTS_DIR, filename)
+    payload = {
+        "query": query,
+        "broadened": broadened,
+        "total_count": search_results.get("total_count"),
+        "returned": len(search_results.get("items", [])),
+        "items": search_results.get("items", []),
+    }
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, default=str)
+    print(f"[search] results saved -> {filepath}")
+
 
 def build_candidates_from_search(query, client: GitHubClient, per_page=30, readme_limit=README_FETCH_LIMIT):
     """
     Search GitHub for repos matching `query`, collect unique owners,
     and build a candidate document for each one.
 
+    If the initial search returns no results, automatically broadens the query
+    by extracting keywords and joining with OR.
+
     Returns a list of candidate dicts, one per unique GitHub user.
     """
     search_results = client.search_repositories(query, per_page=per_page)
+    broadened = False
+
+    if not search_results.get("items"):
+        broad_query = _broaden_query(query)
+        if broad_query != query:
+            print(f"[search] No results for '{query}', retrying with broadened query: '{broad_query}'")
+            search_results = client.search_repositories(broad_query, per_page=per_page)
+            broadened = True
+
+    _save_search_output(query if not broadened else _broaden_query(query), search_results, broadened)
+
     repos = search_results.get("items", [])
 
     # Deduplicate owners while preserving order

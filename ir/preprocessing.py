@@ -28,7 +28,10 @@ def preprocess(text):
     """
     if not text:
         return ""
+    #lowercase
     text = text.lower()
+    #replace non-alphanumeric chars with spaces
     text = re.sub(r"[^a-z0-9\s]", " ", text)
+    #tokenize on whitespace and drop stopwords/single-char tokens
     tokens = [t for t in text.split() if t not in STOPWORDS and len(t) > 1]
     return " ".join(tokens)
