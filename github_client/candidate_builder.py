@@ -22,35 +22,200 @@ _STOPWORDS = {
     "want", "build", "create", "make", "use", "using", "uses",
 }
 
+# Maps lowercase aliases/names found in queries to GitHub's language: qualifier value
+_LANGUAGE_ALIASES: dict[str, str] = {
+    "python": "Python",
+    "javascript": "JavaScript",
+    "js": "JavaScript",
+    "typescript": "TypeScript",
+    "ts": "TypeScript",
+    "java": "Java",
+    "cpp": "C++",
+    "c++": "C++",
+    "csharp": "C#",
+    "c#": "C#",
+    "ruby": "Ruby",
+    "go": "Go",
+    "golang": "Go",
+    "rust": "Rust",
+    "swift": "Swift",
+    "kotlin": "Kotlin",
+    "php": "PHP",
+    "scala": "Scala",
+    "shell": "Shell",
+    "bash": "Shell",
+    "r": "R",
+    "matlab": "MATLAB",
+    "dart": "Dart",
+    "flutter": "Dart",
+    "haskell": "Haskell",
+    "elixir": "Elixir",
+    "clojure": "Clojure",
+    "lua": "Lua",
+    "perl": "Perl",
+    "sql": "SQL",
+}
 
-_GH_QUERY_LIMIT = 256  # GitHub search API rejects queries longer than 256 chars
+# Maps regex patterns (matched against the full query) to GitHub topic: qualifier values
+_TOPIC_PATTERNS: list[tuple[str, str]] = [
+    (r"\bmachine[\s\-]?learning\b", "machine-learning"),
+    (r"\bdeep[\s\-]?learning\b", "deep-learning"),
+    (r"\bneural[\s\-]?network", "neural-network"),
+    (r"\bnlp\b|natural[\s\-]?language[\s\-]?processing", "nlp"),
+    (r"\bcomputer[\s\-]?vision\b", "computer-vision"),
+    (r"\breinforcement[\s\-]?learning\b", "reinforcement-learning"),
+    (r"\bdata[\s\-]?science\b", "data-science"),
+    (r"\bdata[\s\-]?analysis\b", "data-analysis"),
+    (r"\bweb[\s\-]?scraping\b", "web-scraping"),
+    (r"\brest[\s\-]?api\b|\brestful\b", "rest-api"),
+    (r"\bgraphql\b", "graphql"),
+    (r"\bcli\b|command[\s\-]?line", "cli"),
+    (r"\bgui\b|desktop[\s\-]?app", "gui"),
+    (r"\bsqlite\b", "sqlite"),
+    (r"\bpostgres\b|postgresql", "postgresql"),
+    (r"\bmongodb\b", "mongodb"),
+    (r"\bdocker\b", "docker"),
+    (r"\bkubernetes\b|\bk8s\b", "kubernetes"),
+    (r"\bgame[\s\-]?dev\b|game[\s\-]?engine", "game-development"),
+    (r"\bchatbot\b|chat[\s\-]?bot", "chatbot"),
+    (r"\bblockchain\b", "blockchain"),
+    (r"\bcryptocurrency\b|\bcrypto\b", "cryptocurrency"),
+    (r"\bcybersecurity\b|security[\s\-]?tool", "security"),
+    (r"\bspeech[\s\-]?recognition\b|\bvoice\b", "speech-recognition"),
+    (r"\bimage[\s\-]?processing\b", "image-processing"),
+    (r"\bautomation\b", "automation"),
+    (r"\bdevops\b", "devops"),
+    (r"\bmobile[\s\-]?app\b", "mobile"),
+    (r"\bandroid\b", "android"),
+    (r"\bios\b|\bswiftui\b", "ios"),
+]
 
 
-def _broaden_query(query: str) -> str:
+def _extract_qualifier_parts(query: str) -> tuple[str, set[str]]:
     """
-    Convert a natural-language query into a GitHub search query by extracting
-    meaningful keywords and joining them with OR.
-    e.g. "AI event planning app that uses calendars" -> "AI OR event OR planning OR calendars"
-
-    The result is truncated to fit within GitHub's 256-character query limit.
+    Detect language/topic qualifiers and the source words consumed by them.
+    Returns ('language:Python topic:machine-learning', {'python', 'machine', 'learning'}).
     """
-    words = re.findall(r"[A-Za-z0-9]+", query)
-    keywords = [w for w in words if len(w) > 2 and w.lower() not in _STOPWORDS]
-    if not keywords:
-        return query[:_GH_QUERY_LIMIT]
-
-    # Add keywords one by one until we'd exceed the limit
+    q_lower = query.lower()
     parts = []
+    consumed_words: set[str] = set()
+
+    # Language: match whole words/tokens in the query
+    for alias, gh_name in _LANGUAGE_ALIASES.items():
+        pattern = r"\b" + re.escape(alias) + r"\b"
+        if re.search(pattern, q_lower):
+            qualifier = f"language:{gh_name}"
+            if qualifier not in parts:
+                parts.append(qualifier)
+            consumed_words.update(re.findall(r"[A-Za-z0-9]+", alias.lower()))
+
+    # Topics: match phrase patterns
+    for pattern, topic in _TOPIC_PATTERNS:
+        match = re.search(pattern, q_lower)
+        if match:
+            qualifier = f"topic:{topic}"
+            if qualifier not in parts:
+                parts.append(qualifier)
+            consumed_words.update(re.findall(r"[A-Za-z0-9]+", match.group(0).lower()))
+
+    return " ".join(parts), consumed_words
+
+
+def _extract_qualifiers(query: str) -> str:
+    """
+    Detect language and topic qualifiers from a natural-language query.
+    Returns a string like 'language:Python topic:machine-learning topic:sqlite'
+    to be appended to each search chunk.
+    """
+    qualifiers, _ = _extract_qualifier_parts(query)
+    return qualifiers
+
+
+def _extract_keywords(query: str, excluded_words: set[str] | None = None) -> list[str]:
+    """Extract meaningful keywords from a natural-language query."""
+    excluded_words = excluded_words or set()
+    words = re.findall(r"[A-Za-z0-9]+", query)
+    seen = set()
+    keywords = []
+    for w in words:
+        w_lower = w.lower()
+        if (
+            len(w) > 2
+            and w_lower not in _STOPWORDS
+            and w_lower not in excluded_words
+            and w_lower not in seen
+        ):
+            seen.add(w_lower)
+            keywords.append(w)
+    return keywords
+
+
+_GH_QUERY_LIMIT = 256
+
+
+def _chunk_keywords(keywords: list[str], reserved: int = 0) -> list[str]:
+    """
+    Pack keywords into OR-joined chunks that each fit within _GH_QUERY_LIMIT.
+    `reserved` is the number of characters already spoken for by qualifiers
+    (space + qualifier string) so each chunk leaves room for them.
+    Returns a list of keyword-only query strings, one per chunk.
+    """
+    limit = _GH_QUERY_LIMIT - reserved
+    chunks = []
+    current: list[str] = []
     for kw in keywords:
-        candidate = " OR ".join(parts + [kw])
-        if len(candidate) > _GH_QUERY_LIMIT:
-            break
-        parts.append(kw)
+        trial = " OR ".join(current + [kw])
+        if current and len(trial) > limit:
+            chunks.append(" OR ".join(current))
+            current = [kw]
+        else:
+            current.append(kw)
+    if current:
+        chunks.append(" OR ".join(current))
+    return chunks
 
-    return " OR ".join(parts) if parts else keywords[0][:_GH_QUERY_LIMIT]
+
+def _iterative_search(query: str, client: "GitHubClient", per_page: int) -> dict:
+    """
+    Extract keywords and qualifiers from the query, pack keywords into
+    OR-joined chunks that fit within GitHub's query limit, and append
+    language:/topic: qualifiers to each chunk before sending.
+    Returns a dict with 'total_count' and 'items' (deduplicated by full_name).
+    """
+    qualifiers, qualifier_words = _extract_qualifier_parts(query)
+    keywords = _extract_keywords(query, excluded_words=qualifier_words)
+    qualifier_suffix = f" {qualifiers}" if qualifiers else ""
+
+    if qualifiers:
+        print(f"[search] Qualifiers detected: {qualifiers}")
+
+    reserved = len(qualifier_suffix)
+    if keywords:
+        chunks = _chunk_keywords(keywords, reserved=reserved)
+    elif qualifiers:
+        chunks = [""]
+    else:
+        chunks = [query[:_GH_QUERY_LIMIT]]
+
+    seen_repos = {}  # full_name -> item
+    for chunk in chunks:
+        full_query = (chunk + qualifier_suffix) if chunk else qualifiers or query[:_GH_QUERY_LIMIT]
+        print(f"[search] Searching chunk (len={len(full_query)}): '{full_query}'")
+        try:
+            result = client.search_repositories(full_query, per_page=per_page)
+        except Exception as e:
+            print(f"[search] Skipping chunk: {e}")
+            continue
+        for item in result.get("items", []):
+            full_name = item.get("full_name")
+            if full_name and full_name not in seen_repos:
+                seen_repos[full_name] = item
+
+    items = list(seen_repos.values())
+    return {"total_count": len(items), "items": items}
 
 
-def _save_search_output(query: str, search_results: dict, broadened: bool = False):
+def _save_search_output(query: str, search_results: dict):
     """Write raw search results to outputs/ for inspection during testing."""
     os.makedirs(_OUTPUTS_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -58,7 +223,6 @@ def _save_search_output(query: str, search_results: dict, broadened: bool = Fals
     filepath = os.path.join(_OUTPUTS_DIR, filename)
     payload = {
         "query": query,
-        "broadened": broadened,
         "total_count": search_results.get("total_count"),
         "returned": len(search_results.get("items", [])),
         "items": search_results.get("items", []),
@@ -78,13 +242,8 @@ def build_candidates_from_search(query, client: GitHubClient, per_page=30, readm
 
     Returns a list of candidate dicts, one per unique GitHub user.
     """
-    broad_query = _broaden_query(query)
-    broadened = broad_query != query
-    if broadened:
-        print(f"[search] Query broadened: '{broad_query}'")
-    search_results = client.search_repositories(broad_query, per_page=per_page)
-
-    _save_search_output(broad_query, search_results, broadened)
+    search_results = _iterative_search(query, client, per_page=per_page)
+    _save_search_output(query, search_results)
 
     repos = search_results.get("items", [])
 
