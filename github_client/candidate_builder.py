@@ -78,17 +78,13 @@ def build_candidates_from_search(query, client: GitHubClient, per_page=30, readm
 
     Returns a list of candidate dicts, one per unique GitHub user.
     """
-    search_results = client.search_repositories(query, per_page=per_page)
-    broadened = False
+    broad_query = _broaden_query(query)
+    broadened = broad_query != query
+    if broadened:
+        print(f"[search] Query broadened: '{broad_query}'")
+    search_results = client.search_repositories(broad_query, per_page=per_page)
 
-    if not search_results.get("items"):
-        broad_query = _broaden_query(query)
-        if broad_query != query:
-            print(f"[search] No results for '{query}', retrying with broadened query: '{broad_query}'")
-            search_results = client.search_repositories(broad_query, per_page=per_page)
-            broadened = True
-
-    _save_search_output(query if not broadened else _broaden_query(query), search_results, broadened)
+    _save_search_output(broad_query, search_results, broadened)
 
     repos = search_results.get("items", [])
 
