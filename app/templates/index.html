@@ -43,6 +43,17 @@
 
     .search-bar input:focus { border-color: #58a6ff; }
 
+    .char-counter {
+      text-align: right;
+      font-size: 0.78rem;
+      color: #8b949e;
+      max-width: 700px;
+      margin: -1.4rem auto 1.5rem;
+    }
+
+    .char-counter.warn  { color: #d29922; }
+    .char-counter.limit { color: #f85149; }
+
     .search-bar button {
       padding: 0.65rem 1.4rem;
       border-radius: 6px;
@@ -280,19 +291,30 @@
       id="queryInput"
       placeholder="e.g. AI event planning app with calendars and recommendations"
       autocomplete="off"
+      maxlength="400"
     />
     <button type="submit" id="searchBtn">Find Teammates</button>
   </form>
+  <div class="char-counter" id="charCounter">400 characters remaining</div>
 
   <div id="status"></div>
   <div id="results"></div>
 
   <script>
-    const form    = document.getElementById("searchForm");
-    const input   = document.getElementById("queryInput");
-    const btn     = document.getElementById("searchBtn");
-    const status  = document.getElementById("status");
-    const results = document.getElementById("results");
+    const form        = document.getElementById("searchForm");
+    const input       = document.getElementById("queryInput");
+    const btn         = document.getElementById("searchBtn");
+    const status      = document.getElementById("status");
+    const results     = document.getElementById("results");
+    const charCounter = document.getElementById("charCounter");
+
+    const MAX_CHARS = 400;
+
+    input.addEventListener("input", () => {
+      const remaining = MAX_CHARS - input.value.length;
+      charCounter.textContent = `${remaining} character${remaining !== 1 ? "s" : ""} remaining`;
+      charCounter.className = "char-counter" + (remaining <= 0 ? " limit" : remaining <= 50 ? " warn" : "");
+    });
 
     const LANG_COLORS = {
       Python: "#3572A5", JavaScript: "#f1e05a", TypeScript: "#2b7489",

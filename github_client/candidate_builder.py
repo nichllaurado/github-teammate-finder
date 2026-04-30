@@ -23,17 +23,31 @@ _STOPWORDS = {
 }
 
 
+_GH_QUERY_LIMIT = 256  # GitHub search API rejects queries longer than 256 chars
+
+
 def _broaden_query(query: str) -> str:
     """
     Convert a natural-language query into a GitHub search query by extracting
     meaningful keywords and joining them with OR.
     e.g. "AI event planning app that uses calendars" -> "AI OR event OR planning OR calendars"
+
+    The result is truncated to fit within GitHub's 256-character query limit.
     """
     words = re.findall(r"[A-Za-z0-9]+", query)
     keywords = [w for w in words if len(w) > 2 and w.lower() not in _STOPWORDS]
     if not keywords:
-        return query
-    return " OR ".join(keywords)
+        return query[:_GH_QUERY_LIMIT]
+
+    # Add keywords one by one until we'd exceed the limit
+    parts = []
+    for kw in keywords:
+        candidate = " OR ".join(parts + [kw])
+        if len(candidate) > _GH_QUERY_LIMIT:
+            break
+        parts.append(kw)
+
+    return " OR ".join(parts) if parts else keywords[0][:_GH_QUERY_LIMIT]
 
 
 def _save_search_output(query: str, search_results: dict, broadened: bool = False):
@@ -78,14 +92,15 @@ def build_candidates_from_search(query, client: GitHubClient, per_page=30, readm
 
     repos = search_results.get("items", [])
 
-    # Deduplicate owners while preserving order
+    # Deduplicate owners while preserving order; skip organizations
     seen = set()
     unique_owners = []
     for repo in repos:
-        owner = repo.get("owner", {}).get("login")
-        if owner and owner not in seen:
-            seen.add(owner)
-            unique_owners.append(owner)
+        owner = repo.get("owner", {})
+        login = owner.get("login")
+        if login and login not in seen and owner.get("type") == "User":
+            seen.add(login)
+            unique_owners.append(login)
 
     candidates = []
     for username in unique_owners:
@@ -112,6 +127,8 @@ def build_candidate(username, client: GitHubClient, readme_limit=README_FETCH_LI
     field suitable for TF-IDF / BM25 vectorization.
     """
     profile = client.get_user(username)
+    if profile.get("type") == "Organization":
+        raise ValueError(f"{username} is an organization, not an individual user")
     repos = client.get_user_repos(username, per_page=100)
 
     # Sort by stars descending for README prioritization
