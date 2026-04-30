@@ -1,4 +1,6 @@
-from flask import Blueprint, jsonify, request
+import json
+
+from flask import Blueprint, Response, jsonify, request, stream_with_context
 from github_client import GitHubClient, build_candidates_from_search, build_candidate
 from ir import rank_candidates
 import requests as http_requests
@@ -13,8 +15,8 @@ def search_repos():
     if not query:
         return jsonify({"error": "Missing query parameter 'q'"}), 400
 
-    sort = request.args.get("sort", "stars")
-    order = request.args.get("order", "desc")
+    sort = request.args.get("sort")
+    order = request.args.get("order")
     per_page = min(int(request.args.get("per_page", 30)), 100)
     page = int(request.args.get("page", 1))
 
@@ -59,13 +61,56 @@ def get_candidates():
     readme_limit = min(int(request.args.get("readme_limit", 3)), 5)
 
     try:
-        candidates = build_candidates_from_search(
-            query, client, per_page=per_page, readme_limit=readme_limit
+        candidates, queries = build_candidates_from_search(
+            query,
+            client,
+            per_page=per_page,
+            readme_limit=readme_limit,
+            return_search_queries=True,
         )
         ranked = rank_candidates(query, candidates)
-        return jsonify({"query": query, "candidates": ranked})
+        return jsonify({"queries": queries, "candidates": ranked})
     except http_requests.HTTPError as e:
         return jsonify({"error": str(e)}), e.response.status_code
+
+
+@bp.route("/candidates/stream")
+def stream_candidates():
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"error": "Missing query parameter 'q'"}), 400
+
+    per_page = min(int(request.args.get("per_page", 20)), 30)
+    readme_limit = min(int(request.args.get("readme_limit", 3)), 5)
+
+    def event(event_name, payload):
+        return f"event: {event_name}\ndata: {json.dumps(payload)}\n\n"
+
+    @stream_with_context
+    def generate():
+        try:
+            candidates, queries = build_candidates_from_search(
+                query,
+                client,
+                per_page=per_page,
+                readme_limit=readme_limit,
+                return_search_queries=True,
+            )
+            yield event("ranking", {
+                "message": "Candidates fetched - ranking candidates...",
+                "queries": queries,
+                "candidate_count": len(candidates),
+            })
+
+            ranked = rank_candidates(query, candidates)
+            yield event("complete", {"queries": queries, "candidates": ranked})
+        except http_requests.HTTPError as e:
+            status_code = e.response.status_code if e.response is not None else 500
+            yield event("error", {"error": str(e), "status_code": status_code})
+        except Exception as e:
+            yield event("error", {"error": str(e), "status_code": 500})
+
+    return Response(generate(), mimetype="text/event-stream")
 
 
 @bp.route("/rate-limit")

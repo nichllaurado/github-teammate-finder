@@ -27,15 +27,18 @@ class GitHubClient:
         response.raise_for_status()
         return response.json()
 
-    def search_repositories(self, query, sort="stars", order="desc", per_page=30, page=1):
+    def search_repositories(self, query, sort=None, order=None, per_page=30, page=1):
         """Search GitHub repositories by query string."""
-        return self._get("/search/repositories", params={
+        params = {
             "q": query,
-            "sort": sort,
-            "order": order,
             "per_page": per_page,
             "page": page,
-        })
+        }
+        if sort:
+            params["sort"] = sort
+        if order:
+            params["order"] = order
+        return self._get("/search/repositories", params=params)
 
     def get_user(self, username):
         """Fetch a GitHub user's public profile."""

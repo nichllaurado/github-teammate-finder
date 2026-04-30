@@ -421,15 +421,15 @@
       results.innerHTML = "";
       status.innerHTML  = `<span class="spinner"></span>Fetching candidates — this may take a few seconds…`;
 
-      try {
-        const res  = await fetch(`/api/candidates?q=${encodeURIComponent(q)}&per_page=20`);
-        const data = await res.json();
+      const source = new EventSource(`/api/candidates/stream?q=${encodeURIComponent(q)}&per_page=20`);
 
-        if (!res.ok) {
-          status.innerHTML = `<span class="error">Error: ${escHtml(data.error || "Unknown error")}</span>`;
-          return;
-        }
+      source.addEventListener("ranking", (event) => {
+        const data = JSON.parse(event.data || "{}");
+        status.innerHTML = `<span class="spinner"></span>${escHtml(data.message || "Candidates fetched - ranking candidates...")}`;
+      });
 
+      source.addEventListener("complete", (event) => {
+        const data = JSON.parse(event.data || "{}");
         const candidates = data.candidates || [];
         status.textContent = `Found ${candidates.length} candidate${candidates.length !== 1 ? "s" : ""} for: "${q}"`;
         results.innerHTML  = candidates.map((c, i) => renderCandidate(c, i + 1)).join("");
@@ -437,11 +437,21 @@
         if (!candidates.length) {
           status.textContent = "No candidates found. Try a different query.";
         }
-      } catch (err) {
-        status.innerHTML = `<span class="error">Request failed: ${escHtml(err.message)}</span>`;
-      } finally {
+
+        source.close();
         btn.disabled = false;
-      }
+      });
+
+      source.addEventListener("error", (event) => {
+        let message = "Unknown error";
+        if (event.data) {
+          const data = JSON.parse(event.data);
+          message = data.error || message;
+        }
+        status.innerHTML = `<span class="error">Error: ${escHtml(message)}</span>`;
+        source.close();
+        btn.disabled = false;
+      });
     });
   </script>
 </body>

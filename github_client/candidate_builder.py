@@ -3,11 +3,13 @@ import os
 import re
 from datetime import datetime
 
+import requests
+
 from .client import GitHubClient
 
 # Max README chars included in the document text (keeps tokens manageable)
 README_CHAR_LIMIT = 2000
-# Number of top repos (by stars) to fetch READMEs for
+# Number of repos to fetch READMEs for
 README_FETCH_LIMIT = 3
 # Max repos included in the candidate's repo list
 REPO_LIST_LIMIT = 20
@@ -15,12 +17,26 @@ REPO_LIST_LIMIT = 20
 # Path to outputs directory (two levels up from this file: github_client/ -> project root)
 _OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
-# Common English stopwords to skip when broadening a query
+# Common English stopwords to skip when extracting search keywords
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "that", "this", "is", "it", "be", "as", "by", "i",
-    "want", "build", "create", "make", "use", "using", "uses",
+    "want", "build", "create", "make", "use", "using", "uses", "online",
 }
+
+_SHORT_QUERY_LIMIT = 8
+_OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+_OPENAI_QUERY_MODEL = os.getenv("OPENAI_QUERY_MODEL", "gpt-5.4-mini")
+
+_DOMAIN_EXPANSIONS: list[tuple[set[str], tuple[str, ...]]] = [
+    ({"chess"}, ("chess engine", "minimax chess")),
+    ({"game", "multiplayer"}, ("multiplayer game", "game server")),
+    ({"matchmaking"}, ("matchmaking game",)),
+    ({"calendar"}, ("calendar integration", "calendar app")),
+    ({"event"}, ("event planner", "event recommendation")),
+    ({"recommendation", "recommender"}, ("recommendation system", "recommender system")),
+    ({"ai"}, ("ai opponent",)),
+]
 
 # Maps lowercase aliases/names found in queries to GitHub's language: qualifier value
 _LANGUAGE_ALIASES: dict[str, str] = {
@@ -91,6 +107,16 @@ _TOPIC_PATTERNS: list[tuple[str, str]] = [
 ]
 
 
+_TOKEN_PATTERN = r"[A-Za-z0-9+#]+"
+
+
+def _alias_pattern(alias: str) -> str:
+    escaped = re.escape(alias)
+    if re.search(r"[^A-Za-z0-9_]", alias):
+        return rf"(?<![A-Za-z0-9+#]){escaped}(?![A-Za-z0-9+#])"
+    return rf"\b{escaped}\b"
+
+
 def _extract_qualifier_parts(query: str) -> tuple[str, set[str]]:
     """
     Detect language/topic qualifiers and the source words consumed by them.
@@ -102,12 +128,12 @@ def _extract_qualifier_parts(query: str) -> tuple[str, set[str]]:
 
     # Language: match whole words/tokens in the query
     for alias, gh_name in _LANGUAGE_ALIASES.items():
-        pattern = r"\b" + re.escape(alias) + r"\b"
+        pattern = _alias_pattern(alias)
         if re.search(pattern, q_lower):
             qualifier = f"language:{gh_name}"
             if qualifier not in parts:
                 parts.append(qualifier)
-            consumed_words.update(re.findall(r"[A-Za-z0-9]+", alias.lower()))
+            consumed_words.update(re.findall(_TOKEN_PATTERN, alias.lower()))
 
     # Topics: match phrase patterns
     for pattern, topic in _TOPIC_PATTERNS:
@@ -116,7 +142,7 @@ def _extract_qualifier_parts(query: str) -> tuple[str, set[str]]:
             qualifier = f"topic:{topic}"
             if qualifier not in parts:
                 parts.append(qualifier)
-            consumed_words.update(re.findall(r"[A-Za-z0-9]+", match.group(0).lower()))
+            consumed_words.update(re.findall(_TOKEN_PATTERN, match.group(0).lower()))
 
     return " ".join(parts), consumed_words
 
@@ -134,13 +160,13 @@ def _extract_qualifiers(query: str) -> str:
 def _extract_keywords(query: str, excluded_words: set[str] | None = None) -> list[str]:
     """Extract meaningful keywords from a natural-language query."""
     excluded_words = excluded_words or set()
-    words = re.findall(r"[A-Za-z0-9]+", query)
+    words = re.findall(_TOKEN_PATTERN, query)
     seen = set()
     keywords = []
     for w in words:
         w_lower = w.lower()
         if (
-            len(w) > 2
+            (len(w) > 2 or w_lower in {"ai", "ui", "ml"})
             and w_lower not in _STOPWORDS
             and w_lower not in excluded_words
             and w_lower not in seen
@@ -151,34 +177,181 @@ def _extract_keywords(query: str, excluded_words: set[str] | None = None) -> lis
 
 
 _GH_QUERY_LIMIT = 256
+_KEYWORD_IN_QUALIFIER = "in:name,description,readme"
 
 
-def _chunk_keywords(keywords: list[str], reserved: int = 0) -> list[str]:
+def _add_unique_query(queries: list[str], seen: set[str], query: str):
+    query = " ".join(query.split())
+    if query and query.lower() not in seen:
+        seen.add(query.lower())
+        queries.append(query)
+
+
+def _build_short_keyword_queries(keywords: list[str]) -> list[str]:
+    """Build compact GitHub search phrases from the extracted prompt keywords."""
+    queries: list[str] = []
+    seen: set[str] = set()
+    normalized = [kw.lower() for kw in keywords]
+
+    # Adjacent keyword phrases preserve the user's wording: "multiplayer chess",
+    # "chess game", etc. A few weak transitions are left to domain expansions.
+    for left, right in zip(keywords, keywords[1:]):
+        left_lower = left.lower()
+        right_lower = right.lower()
+        if (
+            left_lower in {"app", "game"}
+            and right_lower in {"matchmaking", "recommendation", "recommender"}
+        ) or (
+            left_lower in {"matchmaking", "recommendation", "recommender"}
+            and right_lower in {"ai", "ml"}
+        ):
+            continue
+        _add_unique_query(queries, seen, f"{left} {right}")
+
+    keyword_set = set(normalized)
+    for triggers, expansions in _DOMAIN_EXPANSIONS:
+        if triggers & keyword_set:
+            for expansion in expansions:
+                _add_unique_query(queries, seen, expansion)
+
+    # Pair central nouns with surrounding capabilities when possible.
+    anchors = [kw for kw in keywords if kw.lower() in {"app", "game", "server", "engine"}]
+    descriptors = [
+        kw for kw in keywords
+        if kw.lower() not in {"app", "game", "server", "engine"}
+    ]
+    for anchor in anchors:
+        for descriptor in descriptors:
+            _add_unique_query(queries, seen, f"{descriptor} {anchor}")
+
+    if not queries and keywords:
+        _add_unique_query(queries, seen, " ".join(keywords[:3]))
+
+    return queries[:_SHORT_QUERY_LIMIT]
+
+
+def _openai_query_generation_enabled() -> bool:
+    disabled_values = {"0", "false", "no", "off"}
+    setting = os.getenv("OPENAI_QUERY_GENERATION", "1").strip().lower()
+    return bool(os.getenv("OPENAI_API_KEY")) and setting not in disabled_values
+
+
+def _extract_response_text(response_json: dict) -> str:
+    if isinstance(response_json.get("output_text"), str):
+        return response_json["output_text"]
+
+    parts = []
+    for item in response_json.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") == "output_text" and isinstance(content.get("text"), str):
+                parts.append(content["text"])
+    return "\n".join(parts)
+
+
+def _clean_model_query_chunk(query: str) -> str:
+    query = re.sub(r"\bin:name,description,readme\b", " ", query, flags=re.IGNORECASE)
+    query = re.sub(r"\blanguage:(\"[^\"]+\"|'[^']+'|[^\s]+)", " ", query, flags=re.IGNORECASE)
+    query = re.sub(r"\btopic:(\"[^\"]+\"|'[^']+'|[^\s]+)", " ", query, flags=re.IGNORECASE)
+    return " ".join(query.split()).strip()
+
+
+def _parse_model_query_chunks(response_text: str) -> list[str]:
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError:
+        return []
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("queries"), list):
+        return []
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for raw_query in payload["queries"]:
+        if not isinstance(raw_query, str):
+            continue
+        cleaned = _clean_model_query_chunk(raw_query)
+        if len(cleaned) > _GH_QUERY_LIMIT:
+            cleaned = cleaned[:_GH_QUERY_LIMIT].rsplit(" ", 1)[0].strip()
+        _add_unique_query(queries, seen, cleaned)
+        if len(queries) >= _SHORT_QUERY_LIMIT:
+            break
+    return queries
+
+
+def _build_openai_query_chunks(query: str, keywords: list[str], qualifiers: str) -> list[str]:
     """
-    Pack keywords into OR-joined chunks that each fit within _GH_QUERY_LIMIT.
-    `reserved` is the number of characters already spoken for by qualifiers
-    (space + qualifier string) so each chunk leaves room for them.
-    Returns a list of keyword-only query strings, one per chunk.
+    Ask OpenAI to create compact GitHub repository search phrases.
+    The returned phrases are later expanded with this app's GitHub field and
+    language/topic qualifiers, so this function strips those qualifiers if the
+    model includes them.
     """
-    limit = _GH_QUERY_LIMIT - reserved
-    chunks = []
-    current: list[str] = []
-    for kw in keywords:
-        trial = " OR ".join(current + [kw])
-        if current and len(trial) > limit:
-            chunks.append(" OR ".join(current))
-            current = [kw]
-        else:
-            current.append(kw)
-    if current:
-        chunks.append(" OR ".join(current))
-    return chunks
+    if not _openai_query_generation_enabled():
+        return []
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": _OPENAI_QUERY_MODEL,
+        "instructions": (
+            "Generate concise GitHub repository search query phrases for iterative search. "
+            "Return only JSON that matches the schema. Queries should be short, diverse, "
+            "and likely to find repositories relevant to the user's project. Include domain "
+            "terms, implementation terms, and technology terms when useful. Do not include "
+            "GitHub qualifiers such as in:, language:, stars:, or topic:."
+        ),
+        "input": (
+            f"User project request: {query}\n"
+            f"Extracted keywords: {', '.join(keywords) if keywords else '(none)'}\n"
+            f"Detected GitHub qualifiers that will be appended later: {qualifiers or '(none)'}\n\n"
+            "For a chess project, good query phrases might include: chess game, chess engine, "
+            "multiplayer chess, cpp chess, c++ game server, minimax chess, matchmaking game."
+        ),
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "github_search_queries",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "queries": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": _SHORT_QUERY_LIMIT,
+                        }
+                    },
+                    "required": ["queries"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+    }
+
+    try:
+        response = requests.post(
+            _OPENAI_RESPONSES_URL,
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        response.raise_for_status()
+        chunks = _parse_model_query_chunks(_extract_response_text(response.json()))
+        if chunks:
+            print(f"[search] OpenAI generated query chunks: {chunks}")
+        return chunks
+    except Exception as e:
+        print(f"[search] OpenAI query generation skipped: {e}")
+        return []
 
 
 def _iterative_search(query: str, client: "GitHubClient", per_page: int) -> dict:
     """
     Extract keywords and qualifiers from the query, pack keywords into
-    OR-joined chunks that fit within GitHub's query limit, and append
+    space-separated chunks that fit within GitHub's query limit, and append
     language:/topic: qualifiers to each chunk before sending.
     Returns a dict with 'total_count' and 'items' (deduplicated by full_name).
     """
@@ -189,19 +362,27 @@ def _iterative_search(query: str, client: "GitHubClient", per_page: int) -> dict
     if qualifiers:
         print(f"[search] Qualifiers detected: {qualifiers}")
 
-    reserved = len(qualifier_suffix)
+    keyword_field_suffix = f" {_KEYWORD_IN_QUALIFIER}"
     if keywords:
-        chunks = _chunk_keywords(keywords, reserved=reserved)
+        chunks = _build_openai_query_chunks(query, keywords, qualifiers)
+        if not chunks:
+            chunks = _build_short_keyword_queries(keywords)
     elif qualifiers:
         chunks = [""]
     else:
         chunks = [query[:_GH_QUERY_LIMIT]]
 
     seen_repos = {}  # full_name -> item
+    sent_queries = []
     for chunk in chunks:
-        full_query = (chunk + qualifier_suffix) if chunk else qualifiers or query[:_GH_QUERY_LIMIT]
+        full_query = (
+            chunk + keyword_field_suffix + qualifier_suffix
+            if chunk
+            else qualifiers or query[:_GH_QUERY_LIMIT]
+        )
         print(f"[search] Searching chunk (len={len(full_query)}): '{full_query}'")
         try:
+            sent_queries.append(full_query)
             result = client.search_repositories(full_query, per_page=per_page)
         except Exception as e:
             print(f"[search] Skipping chunk: {e}")
@@ -212,17 +393,17 @@ def _iterative_search(query: str, client: "GitHubClient", per_page: int) -> dict
                 seen_repos[full_name] = item
 
     items = list(seen_repos.values())
-    return {"total_count": len(items), "items": items}
+    return {"total_count": len(items), "items": items, "queries": sent_queries}
 
 
-def _save_search_output(query: str, search_results: dict):
+def _save_search_output(search_results: dict):
     """Write raw search results to outputs/ for inspection during testing."""
     os.makedirs(_OUTPUTS_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"search_results_{timestamp}.json"
     filepath = os.path.join(_OUTPUTS_DIR, filename)
     payload = {
-        "query": query,
+        "queries": search_results.get("queries", []),
         "total_count": search_results.get("total_count"),
         "returned": len(search_results.get("items", [])),
         "items": search_results.get("items", []),
@@ -232,18 +413,21 @@ def _save_search_output(query: str, search_results: dict):
     print(f"[search] results saved -> {filepath}")
 
 
-def build_candidates_from_search(query, client: GitHubClient, per_page=30, readme_limit=README_FETCH_LIMIT):
+def build_candidates_from_search(
+    query,
+    client: GitHubClient,
+    per_page=30,
+    readme_limit=README_FETCH_LIMIT,
+    return_search_queries=False,
+):
     """
     Search GitHub for repos matching `query`, collect unique owners,
     and build a candidate document for each one.
 
-    If the initial search returns no results, automatically broadens the query
-    by extracting keywords and joining with OR.
-
     Returns a list of candidate dicts, one per unique GitHub user.
     """
     search_results = _iterative_search(query, client, per_page=per_page)
-    _save_search_output(query, search_results)
+    _save_search_output(search_results)
 
     repos = search_results.get("items", [])
 
@@ -266,6 +450,9 @@ def build_candidates_from_search(query, client: GitHubClient, per_page=30, readm
             # Skip users whose profiles are inaccessible (orgs, deleted accounts, etc.)
             continue
 
+    if return_search_queries:
+        return candidates, search_results.get("queries", [])
+
     return candidates
 
 
@@ -276,7 +463,7 @@ def build_candidate(username, client: GitHubClient, readme_limit=README_FETCH_LI
     Fetches:
       - public profile
       - all public repos (up to 100)
-      - READMEs for the top `readme_limit` repos by star count
+      - READMEs for the first `readme_limit` repos returned by GitHub
 
     Returns a dict with structured metadata and a flat `document` text
     field suitable for TF-IDF / BM25 vectorization.
@@ -286,8 +473,8 @@ def build_candidate(username, client: GitHubClient, readme_limit=README_FETCH_LI
         raise ValueError(f"{username} is an organization, not an individual user")
     repos = client.get_user_repos(username, per_page=100)
 
-    # Sort by stars descending for README prioritization
-    repos_sorted = sorted(repos, key=lambda r: r.get("stargazers_count", 0), reverse=True)
+    # get_user_repos already returns owner repos by recent update; do not reorder by stars.
+    repos_sorted = repos
 
     # Attach README text to top repos
     for repo in repos_sorted[:readme_limit]:
