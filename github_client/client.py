@@ -65,6 +65,32 @@ class GitHubClient:
         except Exception:
             return ""
 
+    def get_repo_tree(self, owner, repo):
+        """
+        Fetch the recursive file tree for a repository.
+        Returns a list of tree node dicts with 'path', 'type', 'size'.
+        """
+        try:
+            data = self._get(
+                f"/repos/{owner}/{repo}/git/trees/HEAD",
+                params={"recursive": "1"},
+            )
+            return data.get("tree", [])
+        except Exception:
+            return []
+
+    def get_file_content(self, owner, repo, path):
+        """Fetch raw text content of a single file. Returns empty string on failure."""
+        import base64
+        try:
+            data = self._get(f"/repos/{owner}/{repo}/contents/{path}")
+            content = data.get("content", "")
+            if data.get("encoding") == "base64":
+                return base64.b64decode(content).decode("utf-8", errors="ignore")
+            return content
+        except Exception:
+            return ""
+
     def get_rate_limit(self):
         """Check current API rate limit status."""
         return self._get("/rate_limit")

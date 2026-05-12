@@ -14,6 +14,70 @@ README_FETCH_LIMIT = 3
 # Max repos included in the candidate's repo list
 REPO_LIST_LIMIT = 20
 
+# Code extraction limits (keeps API calls manageable)
+_CODE_REPOS_LIMIT = 2       # repos to extract code signals from per candidate
+_CODE_FILES_PER_REPO = 4    # source files to sample per repo
+_CODE_FILE_SIZE_LIMIT = 80_000  # bytes; skip files larger than this
+_CODE_COMMENT_LIMIT = 30    # max comment snippets to collect
+
+# File extensions treated as source code
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".java", ".go", ".cpp", ".c", ".cs",
+    ".rb", ".rs", ".swift", ".kt",
+}
+
+# Patterns that identify function/method definitions across common languages
+_FUNC_PATTERNS = [
+    r"\bdef\s+([a-zA-Z_][a-zA-Z0-9_]+)",                          # Python, Ruby
+    r"\bfn\s+([a-zA-Z_][a-zA-Z0-9_]+)",                           # Rust
+    r"\bfunc\s+(?:\([^)]*\)\s+)?([a-zA-Z_][a-zA-Z0-9_]+)",       # Go
+    r"\bfunction\s+([a-zA-Z_$][a-zA-Z0-9_$]+)",                   # JS/TS
+    r"(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]+)\s*=\s*(?:async\s*)?\(",  # JS arrow fns
+    r"\bfun\s+([a-zA-Z_][a-zA-Z0-9_]+)",                          # Kotlin/Swift
+    # Java/C#/C++: modifier(s) + return type + name + (
+    r"(?:public|private|protected|static|async|override|virtual|void|int|long|bool|string|String|float|double)\s+([a-zA-Z_][a-zA-Z0-9_]+)\s*\(",
+]
+
+# Patterns that extract comment text
+_COMMENT_PATTERNS = [
+    (r"#\s*(.+)",          0),   # Python/Ruby/Shell line comments
+    (r"//\s*(.+)",         0),   # JS/TS/Java/Go/C++ line comments
+    (r"/\*+\s*(.*?)\s*\*+/", re.DOTALL),  # /* block */ comments
+]
+
+
+def _split_identifier(name: str) -> str:
+    """Convert snake_case or camelCase identifiers to space-separated words."""
+    name = re.sub(r"_+", " ", name)
+    name = re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
+    return name.lower().strip()
+
+
+def _extract_code_signals(code: str) -> tuple[str, str]:
+    """
+    Extract function/method names and comment text from source code.
+    Returns (functions_text, comments_text) as whitespace-joined strings.
+    """
+    func_words = []
+    for pattern in _FUNC_PATTERNS:
+        for m in re.finditer(pattern, code):
+            name = m.group(1)
+            # Skip very short names and private/dunder names
+            if len(name) > 2 and not name.startswith("__"):
+                func_words.append(_split_identifier(name))
+
+    comments = []
+    for pattern, flags in _COMMENT_PATTERNS:
+        for m in re.finditer(pattern, code, flags):
+            text = m.group(1).strip()
+            if len(text) > 5:
+                comments.append(text[:200])
+            if len(comments) >= _CODE_COMMENT_LIMIT:
+                break
+
+    return " ".join(func_words), " ".join(comments)
+
 # Path to outputs directory (two levels up from this file: github_client/ -> project root)
 _OUTPUTS_DIR = os.path.join(os.path.dirname(__file__), "..", "outputs")
 
@@ -480,11 +544,36 @@ def build_candidate(username, client: GitHubClient, readme_limit=README_FETCH_LI
     for repo in repos_sorted[:readme_limit]:
         repo["readme"] = client.get_readme(username, repo["name"])
 
+    # Extract function names and comments from source files in top repos
+    all_functions: list[str] = []
+    all_comments: list[str] = []
+    for repo in repos_sorted[:_CODE_REPOS_LIMIT]:
+        tree = client.get_repo_tree(username, repo["name"])
+        code_paths = [
+            node["path"]
+            for node in tree
+            if node.get("type") == "blob"
+            and os.path.splitext(node["path"])[1].lower() in _CODE_EXTENSIONS
+            and node.get("size", 0) < _CODE_FILE_SIZE_LIMIT
+        ][:_CODE_FILES_PER_REPO]
+
+        for path in code_paths:
+            content = client.get_file_content(username, repo["name"], path)
+            if content:
+                fnames, fcomments = _extract_code_signals(content)
+                if fnames:
+                    all_functions.append(fnames)
+                if fcomments:
+                    all_comments.append(fcomments)
+
     # Aggregate languages and topics across all repos
     languages = _unique_ordered([r.get("language") for r in repos_sorted if r.get("language")])
     topics = _unique_ordered([t for r in repos_sorted for t in r.get("topics", [])])
 
     document = _build_document(profile, repos_sorted)
+    descriptions_text = _build_descriptions_text(profile, repos_sorted)
+    functions_text = " ".join(all_functions)
+    comments_text = " ".join(all_comments)
 
     return {
         "username": username,
@@ -499,6 +588,9 @@ def build_candidate(username, client: GitHubClient, readme_limit=README_FETCH_LI
         "topics": topics,
         "repos": [_slim_repo(r) for r in repos_sorted[:REPO_LIST_LIMIT]],
         "document": document,
+        "descriptions_text": descriptions_text,
+        "functions_text": functions_text,
+        "comments_text": comments_text,
     }
 
 
@@ -532,6 +624,24 @@ def _build_document(profile, repos):
         if readme:
             parts.append(readme[:README_CHAR_LIMIT])
 
+    return " ".join(filter(None, parts))
+
+
+def _build_descriptions_text(profile, repos):
+    """
+    Build a text field focused on repo descriptions, topics, and profile bio.
+    Used as the primary signal field for cosine similarity scoring.
+    """
+    parts = []
+    for field in ("bio",):
+        val = profile.get(field)
+        if val:
+            parts.append(val)
+    for repo in repos:
+        if repo.get("description"):
+            parts.append(repo["description"])
+        for topic in repo.get("topics", []):
+            parts.append(topic.replace("-", " "))
     return " ".join(filter(None, parts))
 
 
