@@ -8,6 +8,9 @@ import requests as http_requests
 bp = Blueprint("api", __name__)
 client = GitHubClient()
 
+# Accumulates Average Precision per query for running MAP
+_eval_aps = []
+
 
 @bp.route("/search/repos")
 def search_repos():
@@ -111,6 +114,57 @@ def stream_candidates():
             yield event("error", {"error": str(e), "status_code": 500})
 
     return Response(generate(), mimetype="text/event-stream")
+
+
+@bp.route("/eval", methods=["POST"])
+def evaluate():
+    data = request.get_json(force=True)
+    query = data.get("query", "")
+    judgments = data.get("judgments", [])  # ordered list of bool, rank 1..K
+
+    k = len(judgments)
+    if k == 0:
+        return jsonify({"error": "No judgments provided"}), 400
+
+    p_at_k = sum(judgments) / k
+
+    relevant = sum(judgments)
+    if relevant == 0:
+        ap = 0.0
+    else:
+        ap = sum(
+            (sum(judgments[: i + 1]) / (i + 1))
+            for i, j in enumerate(judgments) if j
+        ) / relevant
+
+    rr = 0.0
+    for i, j in enumerate(judgments):
+        if j:
+            rr = 1.0 / (i + 1)
+            break
+
+    _eval_aps.append(ap)
+    running_map = sum(_eval_aps) / len(_eval_aps)
+    n_queries = len(_eval_aps)
+
+    marks = ["✓" if j else "✗" for j in judgments]
+    print("\n" + "=" * 52, flush=True)
+    print(f"  QUERY : {query}", flush=True)
+    print(f"  Labels: {' '.join(marks)}", flush=True)
+    print(f"  P@{k}   : {p_at_k:.3f}  ({int(p_at_k * k)}/{k} relevant)", flush=True)
+    print(f"  AP    : {ap:.3f}", flush=True)
+    print(f"  RR    : {rr:.3f}", flush=True)
+    print(f"  MAP   : {running_map:.3f}  (over {n_queries} quer{'y' if n_queries == 1 else 'ies'})", flush=True)
+    print("=" * 52, flush=True)
+
+    return jsonify({
+        "precision_at_k": p_at_k,
+        "average_precision": ap,
+        "reciprocal_rank": rr,
+        "running_map": running_map,
+        "query_count": n_queries,
+        "k": k,
+    })
 
 
 @bp.route("/rate-limit")

@@ -263,6 +263,49 @@
       font-size: 0.72rem;
     }
 
+    /* ── Eval buttons ── */
+    .eval-row {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.9rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid #21262d;
+    }
+
+    .eval-label { font-size: 0.78rem; color: #8b949e; }
+
+    .eval-btn {
+      padding: 0.22rem 0.7rem;
+      border-radius: 999px;
+      border: 1px solid;
+      font-size: 0.78rem;
+      cursor: pointer;
+      background: transparent;
+      font-family: inherit;
+      transition: background 0.12s, color 0.12s;
+    }
+
+    .eval-btn:disabled { opacity: 0.45; cursor: default; }
+    .eval-relevant  { border-color: #3fb950; color: #3fb950; }
+    .eval-relevant.active,  .eval-relevant:not(:disabled):hover  { background: #3fb950; color: #0d1117; }
+    .eval-irrelevant { border-color: #f85149; color: #f85149; }
+    .eval-irrelevant.active, .eval-irrelevant:not(:disabled):hover { background: #f85149; color: #fff; }
+
+    /* ── Eval progress bar ── */
+    #eval-bar {
+      max-width: 860px;
+      margin: 0 auto 1rem;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      font-size: 0.84rem;
+      color: #8b949e;
+    }
+
+    #eval-bar.done { border-color: #3fb950; color: #3fb950; }
+
     .error { color: #f85149; text-align: center; font-size: 0.9rem; }
 
     .spinner {
@@ -298,6 +341,7 @@
   <div class="char-counter" id="charCounter">400 characters remaining</div>
 
   <div id="status"></div>
+  <div id="eval-bar" style="display:none"></div>
   <div id="results"></div>
 
   <script>
@@ -305,8 +349,57 @@
     const input       = document.getElementById("queryInput");
     const btn         = document.getElementById("searchBtn");
     const status      = document.getElementById("status");
+    const evalBar     = document.getElementById("eval-bar");
     const results     = document.getElementById("results");
     const charCounter = document.getElementById("charCounter");
+
+    // ── Eval state ──────────────────────────────────────────────────────────
+    let judgments    = {};   // rank (1-based) → true/false
+    let evalTotal    = 0;    // min(5, candidates.length)
+    let evalDone     = false;
+    let currentQuery = "";
+
+    function judge(rank, isRelevant) {
+      if (evalDone) return;
+      judgments[rank] = isRelevant;
+
+      const row = document.querySelector(`.eval-row[data-rank="${rank}"]`);
+      row.querySelector(".eval-relevant").classList.toggle("active", isRelevant);
+      row.querySelector(".eval-irrelevant").classList.toggle("active", !isRelevant);
+
+      const labeled = Object.keys(judgments).length;
+      evalBar.textContent = `Label top ${evalTotal} results to compute metrics — ${labeled}/${evalTotal} labeled`;
+
+      if (labeled === evalTotal) submitEval();
+    }
+
+    async function submitEval() {
+      evalDone = true;
+      // Disable all eval buttons
+      document.querySelectorAll(".eval-btn").forEach(b => b.disabled = true);
+
+      const ordered = Array.from({ length: evalTotal }, (_, i) => !!judgments[i + 1]);
+      evalBar.textContent = "Computing metrics…";
+
+      try {
+        const resp = await fetch("/api/eval", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: currentQuery, judgments: ordered }),
+        });
+        const d = await resp.json();
+        evalBar.className = "done";
+        const qWord = d.query_count === 1 ? "query" : "queries";
+        evalBar.textContent =
+          `P@${d.k}: ${(d.precision_at_k * 100).toFixed(0)}%  |  ` +
+          `AP: ${d.average_precision.toFixed(3)}  |  ` +
+          `RR: ${d.reciprocal_rank.toFixed(3)}  |  ` +
+          `Running MAP: ${d.running_map.toFixed(3)} (${d.query_count} ${qWord})` +
+          `  — full output in server console`;
+      } catch (_) {
+        evalBar.textContent = "Failed to send judgments to server.";
+      }
+    }
 
     const MAX_CHARS = 400;
 
@@ -409,6 +502,13 @@
               <div class="repo-list-title">Top repositories</div>
               ${repoItems}
             </div>` : ""}
+
+          ${rank <= 5 ? `
+            <div class="eval-row" data-rank="${rank}">
+              <span class="eval-label">Relevant?</span>
+              <button class="eval-btn eval-relevant"   onclick="judge(${rank}, true)">✓ Relevant</button>
+              <button class="eval-btn eval-irrelevant" onclick="judge(${rank}, false)">✗ Not Relevant</button>
+            </div>` : ""}
         </div>`;
     }
 
@@ -420,6 +520,14 @@
       btn.disabled = true;
       results.innerHTML = "";
       status.innerHTML  = `<span class="spinner"></span>Fetching candidates — this may take a few seconds…`;
+
+      // Reset eval state for new search
+      judgments    = {};
+      evalTotal    = 0;
+      evalDone     = false;
+      currentQuery = q;
+      evalBar.style.display = "none";
+      evalBar.className     = "";
 
       const source = new EventSource(`/api/candidates/stream?q=${encodeURIComponent(q)}&per_page=20`);
 
@@ -436,6 +544,12 @@
 
         if (!candidates.length) {
           status.textContent = "No candidates found. Try a different query.";
+        }
+
+        evalTotal = Math.min(5, candidates.length);
+        if (evalTotal > 0) {
+          evalBar.style.display = "block";
+          evalBar.textContent   = `Label top ${evalTotal} results to compute eval metrics — 0/${evalTotal} labeled`;
         }
 
         source.close();
